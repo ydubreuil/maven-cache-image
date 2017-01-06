@@ -1,0 +1,97 @@
+proxy_cache_path /cache/metadata levels=1:2 keys_zone=metadata:512m use_temp_path=off inactive=${CACHE_EXPIRE} max_size=${CACHE_SIZE_METADATA};
+proxy_cache_path /cache/default levels=1:2 keys_zone=default:512m use_temp_path=off inactive=${CACHE_EXPIRE} max_size=${CACHE_SIZE_ARTIFACT};
+proxy_cache_key "$scheme$request_method$request_uri";
+
+# artifact metadata goes into a dedicated cache fed by a dedicated thread pool
+map $request_uri $cache {
+  ~\.asc$   metadata;
+  ~\.pom$   metadata;
+  ~\.md5$   metadata;
+  ~\.sha1$  metadata;
+
+  default default;
+}
+
+# try to exclude files not related to artifacts
+map $request_uri $skip_cache {
+  ~maven-metadata\.xml$ 1;
+  ~maven-metadata\.xml\.md5$ 1;
+  ~maven-metadata\.xml\.sha1$ 1;
+  ~archetype-catalog\.xml$ 1;
+  ~archetype-catalog\.xml\.md5$ 1;
+  ~archetype-catalog\.xml\.sha1$ 1;
+
+  # folder starting with a dot are suspicious...
+  ~/\..* 1;
+
+  default 0;
+}
+
+upstream backend_jenkins {
+  server repo.jenkins-ci.org:80 max_fails=4;
+  server repo.jenkins-ci.org:80 max_fails=4;
+  server repo.jenkins-ci.org:80 max_fails=4;
+  server repo.jenkins-ci.org:80 max_fails=4;
+  least_conn;
+  zone backend_jenkins 64k;
+  keepalive 32;
+}
+
+upstream backend_central {
+  server repo.maven.apache.org:80 max_fails=4;
+  server repo.maven.apache.org:80 max_fails=4;
+  server repo.maven.apache.org:80 max_fails=4;
+  server repo.maven.apache.org:80 max_fails=4;
+  least_conn;
+  zone backend_central 64k;
+  keepalive 32;
+}
+
+server {
+  # Note that it's listening on port 80
+  listen 80 default_server fastopen=256;
+
+  location / {
+      root   /usr/share/nginx/html;
+      index  index.html index.htm;
+  }
+
+  error_page   500 502 503 504  /50x.html;
+  location = /50x.html {
+      root   /usr/share/nginx/html;
+  }
+
+  aio threads=$cache;
+
+  proxy_cache_valid ${CACHE_EXPIRE};
+  proxy_cache_valid 404 1m;
+  proxy_cache_lock on;
+
+  proxy_ignore_client_abort on;
+
+  proxy_redirect / /;
+  proxy_pass_request_headers off;
+  proxy_pass_request_body off;
+  proxy_no_cache $skip_cache;
+
+  gzip on;
+  gzip_proxied any;
+  gzip_types application/xml application/x-maven-pom+xml;
+  gzip_min_length 1500;
+
+  location /mirrors/central {
+    proxy_cache $cache;
+    proxy_pass http://backend_central/maven2;
+    proxy_set_header Host "repo.maven.apache.org";
+    proxy_set_header Connection "";
+    proxy_http_version 1.1;
+  }
+
+  location /mirrors/jenkins {
+    proxy_cache $cache;
+    proxy_pass http://backend_jenkins/public;
+    proxy_set_header Host "repo.jenkins-ci.org";
+    proxy_set_header Connection "";
+    proxy_http_version 1.1;
+  }
+}
